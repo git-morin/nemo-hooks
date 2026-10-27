@@ -2,27 +2,27 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
 NIM_MAIN := src/nemohooks.nim
-NIM_SRC := $(wildcard src/*.nim src/nemohooks/*.nim)
+NIM_SRC := $(wildcard src/*.nim src/nemohooks/*.nim src/nemohooks/backends/*.nim examples/*.nim)
+# Backends share names on purpose, so nothing imports them all and each is its own target.
+NIM_CHECK := $(NIM_MAIN) $(wildcard src/nemohooks/backends/*.nim examples/*.nim)
 TOOLS_DIR := .tools
 NIMONY_VERSION := 0.6.3
-# Overridable so one unpacked toolchain can serve several checkouts, which is how a consumer
-# repo that already has it (VDExtra) runs this target: NIMONY_DIR=../vdextra/.tools/... make
+# Overridable so one unpacked toolchain can serve several checkouts.
 NIMONY_DIR ?= $(TOOLS_DIR)/nimony-$(NIMONY_VERSION)/nimony
 NIMONY := $(NIMONY_DIR)/bin/nimony.exe
-# --compat makes Nimony read the same nim.cfg Nim 2 uses, so the target is declared once.
+# --compat makes Nimony read the same nim.cfg Nim 2 uses.
 NIMONY_FLAGS := --compat --os:android --cpu:arm64
 
 .PHONY: help help-more lint check nimony-check fmt fmt-check require-nimony
 
 lint: check fmt-check ## Type-check and check formatting - the same gate CI runs
 
-check: # Type-check against the real android target
-	@nim check --hints:off $(NIM_MAIN)
+check: # Type-check every module against the real android target
+	@for f in $(NIM_CHECK); do 	  echo "nim check $$f"; 	  nim check --hints:off --path:src "$$f" || exit 1; 	done
 
-# Not in `lint`, and not in CI: Nimony ships as a nightly zip rather than a release artifact a
-# workflow can pin, so the dual-compiler gate stays a local one. Run it before pushing.
+# Local only: Nimony ships as a nightly zip a workflow cannot pin. Run it before pushing.
 nimony-check: require-nimony ## Type-check the same sources with Nimony (Nim 3)
-	@$(NIMONY) check $(NIMONY_FLAGS) $(NIM_MAIN)
+	@for f in $(NIM_CHECK); do 	  echo "nimony check $$f"; 	  $(NIMONY) check $(NIMONY_FLAGS) --path:src "$$f" || exit 1; 	done
 
 require-nimony:
 	@test -x "$(NIMONY)" || { \

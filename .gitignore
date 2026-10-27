@@ -5,3 +5,5 @@ nimony.paths
 deps/
 *.nif
 .tools/
+.idea/
+changelog.md

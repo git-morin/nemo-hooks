@@ -32,9 +32,8 @@ jobs:
           nim-version: ${{ env.NIM_VERSION }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # nim.cfg names the android/arm64 target, which is the only one this library is built
-      # for, so the check runs against it here too. Nimony is the other half of the gate but
-      # ships as a nightly zip a workflow cannot pin, so `make nimony-check` stays local.
+      # nim.cfg names the android/arm64 target this library is built for. Nimony is the other
+      # half of the gate, but ships as a nightly zip a workflow cannot pin, so it stays local.
       - name: Type-check Nim
         run: make check
 
@@ -42,7 +41,7 @@ jobs:
         run: |
           fail=0
           tmp=$(mktemp -d)
-          for f in src/*.nim src/nemohooks/*.nim; do
+          for f in src/*.nim src/nemohooks/*.nim src/nemohooks/backends/*.nim examples/*.nim; do
             cp "$f" "$tmp/$(basename "$f")"
             nimpretty --maxLineLen:100 --out:"$tmp/$(basename "$f")" "$f"
             if ! diff -u "$f" "$tmp/$(basename "$f")"; then
@@ -52,8 +51,7 @@ jobs:
           done
           exit $fail
 
-      # The package has to stay installable, which is a separate failure mode from compiling:
-      # a bad srcDir or a main module that does not match the package name only shows up here.
+      # A bad srcDir, or a main module not matching the package name, only shows up here.
       - name: Check the package installs
         run: nimble install -y
 
@@ -76,15 +74,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Tags are plain `vX.Y.Z`, which is what nimble and pnak resolve a `requires` range
-          # against. VDExtra's VersionCode-VersionName tags exist for the LSPosed module repo;
-          # a library has no versionCode, so that half of the scheme is dropped here.
+          # Plain `vX.Y.Z`, which is what nimble and pnak resolve a `requires` range against.
           stable_tag=$(git tag -l 'v[0-9]*' | sort -V | tail -1 || true)
           declared=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' nemohooks.nimble)
 
           if [ -z "$stable_tag" ]; then
-            # First release: publish the version already declared in the .nimble rather than
-            # bumping up from 0.0.0, which would land below what VDExtra already requires.
+            # First release: publish the version the .nimble already declares.
             next="$declared"
             range=""
             bump="none (first release, taken from nemohooks.nimble)"
@@ -95,9 +90,7 @@ jobs:
             patch=$(echo "$base" | cut -d. -f3)
             range="$stable_tag..HEAD"
 
-            # Gitmoji drives the bump, since the subjects carry no conventional-commit type.
-            # Anchored at the start of the subject so a commit *describing* a marker cannot
-            # trip it. Shortcodes only, matching the convention the history uses.
+            # Gitmoji drives the bump. Anchored at the start of the subject, shortcodes only.
             subjects=$(git log --pretty=%s "$range")
             if echo "$subjects" | grep -q '^:boom:'; then
               major=$((major + 1)); minor=0; patch=0; bump=major
@@ -109,13 +102,8 @@ jobs:
             next="$major.$minor.$patch"
           fi
 
-          # Only the paths a consumer actually compiles count as a change worth a tag, so a
-          # README or workflow push does not burn a version. VDExtra releases every push to
-          # main because a stable APK is a deliberate act; here main is the only release
-          # branch, so the gate that protects the dev channel there applies to main instead.
-          #
-          # The previous tag points at the bump commit itself, so the .nimble edit this job
-          # makes is never what the diff sees.
+          # Only the paths a consumer compiles count as a change worth a tag. The previous tag
+          # points at the bump commit, so this job's own .nimble edit is never what the diff sees.
           publish=true
           if [ -n "$stable_tag" ] && git diff --quiet "$stable_tag" HEAD -- src nemohooks.nimble nim.cfg; then
             publish=false
@@ -131,7 +119,7 @@ jobs:
           {
             echo "### $next"
             echo
-            # The bump commits this job writes are mechanical, so they stay out of the notes.
+            # The bump commits this job writes stay out of the notes.
             git log --pretty='- %s' ${range:+$range} | grep -v '^- :bookmark:' || true
           } > changelog.md
           cat changelog.md
@@ -144,9 +132,7 @@ jobs:
 
   release:
     needs: version
-    # Only a real push to main publishes. A manual dispatch just runs the gate, and the owner
-    # check keeps a fork, or anyone who reaches a branch here, from publishing under this
-    # repo's name and pushing to its main.
+    # Only a real push to main publishes; the owner check keeps a fork from publishing here.
     if: >-
       github.event_name == 'push'
       && needs.version.outputs.publish == 'true'
@@ -165,10 +151,8 @@ jobs:
         with:
           name: changelog
 
-      # nimble and pnak read the version out of the .nimble at the tagged commit, not out of
-      # the tag name, so the two have to agree or a consumer's `requires` range resolves to the
-      # wrong release. That is why this is the one version in the tree rather than derived from
-      # tags the way VDExtra's is - and why the bump is committed before the tag is cut.
+      # nimble reads the version from the .nimble at the tagged commit, not from the tag name,
+      # so the bump is committed before the tag is cut.
       - name: Bump the declared version and tag it
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -187,8 +171,7 @@ jobs:
           sed -i "s/^version .*/version       = \"$NAME\"/" nemohooks.nimble
           grep -q "\"$NAME\"" nemohooks.nimble
 
-          # [skip ci] is load-bearing: this push lands on main and would otherwise retrigger
-          # the workflow, which would then compute the next patch version off its own commit.
+          # [skip ci] is load-bearing: this push lands on main and would retrigger the workflow.
           if ! git diff --quiet -- nemohooks.nimble; then
             git commit -q -m ":bookmark: $NAME [skip ci]" -- nemohooks.nimble
             git push origin HEAD:main

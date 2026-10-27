@@ -1,9 +1,12 @@
-## Raw interop; see nemohooks.nim for why these two features are on.
-when defined(nimony):
-  {.feature: "lenientnils".}
-  {.feature: "assumeSync".}
+## The Mono backend: Unity, Xenko, anything hosting `libmonosgen`.
+##
+## Above `resolveMono` is the runtime's C API, resolved out of the target's mapped image rather
+## than linked against; below it is the surface a feature writes against.
+include nemohooks/features
 
-import compat
+import std/atomics
+import ../[compat, log, elfsyms, managed, backend, hook, feature]
+export managed
 
 type
   MonoImage* = pointer
@@ -48,10 +51,6 @@ type
   GetDomainFn* = proc(): MonoDomain {.cdecl, gcsafe.}
   GetNameFn* = proc(p: pointer): cstring {.cdecl, gcsafe.}
 
-  SymResolver* = proc(name: cstring): pointer {.cdecl, gcsafe.}
-    ## Answers the address of a symbol in the target's mapped runtime image; `runtime` builds
-    ## one over the `ElfSyms` it attaches to.
-
 var
   pGetCorlib*: GetCorlibFn
   pClassFromName*: ClassFromNameFn
@@ -90,19 +89,6 @@ var
 var
   gCorlib*: MonoImage
   gDomain*: MonoDomain
-
-## Nimony refuses a direct `cast` between `pointer` and a proc type, and that conversion is the
-## whole point of this module: every Mono entry point is resolved to a bare address and then
-## called through a typed signature. Casting a *pointer to* the proc type and dereferencing is
-## accepted by both compilers and loads the same word, so these two keep one source compiling
-## under Nim 2 and Nimony alike.
-proc asProc*[T](p: pointer): T =
-  var tmp = p
-  cast[ptr T](addr tmp)[]
-
-proc asPointer*[T](f: T): pointer =
-  var tmp = f
-  cast[ptr pointer](addr tmp)[]
 
 proc resolveMono*(sym: SymResolver) =
   pGetCorlib = asProc[GetCorlibFn](sym("mono_get_corlib"))
@@ -154,74 +140,21 @@ proc domain*(): MonoDomain =
   if pGetRootDomain != nil: return pGetRootDomain()
   nil
 
-proc monoStrLen*(s: MonoString): int =
-  if s == nil: 0 else: int(cast[ptr int32](cast[uint64](s) + 16)[])
+proc monoStrLen*(s: MonoString): int = strLen(s)
 
-proc monoStrChars*(s: MonoString): ptr UncheckedArray[uint16] =
-  cast[ptr UncheckedArray[uint16]](cast[uint64](s) + 20)
+proc monoStrChars*(s: MonoString): ptr UncheckedArray[uint16] = strChars(s)
 
-proc utf16ToUtf8*(s: ptr UncheckedArray[uint16], len: int): string =
-  result = newStringOfCap(len * 3)
-  var i = 0
-  while i < len:
-    var cp = uint32(s[i])
-    if cp >= 0xD800'u32 and cp <= 0xDBFF'u32 and i + 1 < len and
-       s[i+1] >= 0xDC00'u16 and s[i+1] <= 0xDFFF'u16:
-      cp = 0x10000'u32 + ((cp - 0xD800'u32) shl 10) + (uint32(s[i+1]) - 0xDC00'u32)
-      inc i
-    if cp < 0x80'u32:
-      result.add char(cp)
-    elif cp < 0x800'u32:
-      result.add char(0xC0'u32 or (cp shr 6))
-      result.add char(0x80'u32 or (cp and 0x3F'u32))
-    elif cp < 0x10000'u32:
-      result.add char(0xE0'u32 or (cp shr 12))
-      result.add char(0x80'u32 or ((cp shr 6) and 0x3F'u32))
-      result.add char(0x80'u32 or (cp and 0x3F'u32))
-    else:
-      result.add char(0xF0'u32 or (cp shr 18))
-      result.add char(0x80'u32 or ((cp shr 12) and 0x3F'u32))
-      result.add char(0x80'u32 or ((cp shr 6) and 0x3F'u32))
-      result.add char(0x80'u32 or (cp and 0x3F'u32))
-    inc i
-
-proc utf8ToUtf16*(u8: string, outBuf: var seq[uint16]) =
-  outBuf.setLen(0)
-  var i = 0
-  let n = u8.len
-  while i < n:
-    let c = uint32(uint8(u8[i]))
-    var cp: uint32
-    var extra: int
-    if c < 0x80'u32: cp = c; extra = 0
-    elif (c and 0xE0'u32) == 0xC0'u32: cp = c and 0x1F'u32; extra = 1
-    elif (c and 0xF0'u32) == 0xE0'u32: cp = c and 0x0F'u32; extra = 2
-    elif (c and 0xF8'u32) == 0xF0'u32: cp = c and 0x07'u32; extra = 3
-    else:
-      inc i
-      continue
-    if i + extra >= n: break
-    for k in 0 ..< extra:
-      cp = (cp shl 6) or (uint32(uint8(u8[i + 1 + k])) and 0x3F'u32)
-    i += 1 + extra
-    if cp <= 0xFFFF'u32:
-      outBuf.add uint16(cp)
-    else:
-      let v = cp - 0x10000'u32
-      outBuf.add uint16(0xD800'u32 or (v shr 10))
-      outBuf.add uint16(0xDC00'u32 or (v and 0x3FF'u32))
-
-var tUtf16 {.threadvar.}: seq[uint16]
-
-proc makeMono*(u8: string): MonoString =
+proc makeString*(u8: string): MonoString =
+  ## Allocated in the target's heap: valid only while something managed references it.
   if pStringNewUtf16 == nil: return nil
-  utf8ToUtf16(u8, tUtf16)
-  if tUtf16.len == 0: return nil
-  pStringNewUtf16(domain(), addr tUtf16[0], int32(tUtf16.len))
+  utf8ToUtf16(u8, utf16Scratch)
+  if utf16Scratch.len == 0: return nil
+  pStringNewUtf16(domain(), addr utf16Scratch[0], int32(utf16Scratch.len))
+
+proc makeMono*(u8: string): MonoString = makeString(u8)
 
 proc getClass*(qname: string): MonoClass =
-  ## Resolves an assembly-qualified name through System.Type.GetType, which searches every
-  ## loaded assembly; mono_class_from_name would need the right MonoImage in hand first.
+  ## Resolved through System.Type.GetType, which searches every loaded assembly.
   if pClassFromName == nil or pClassGetMethod == nil or pRuntimeInvoke == nil or
      pTypeGetClass == nil or corlib() == nil:
     return nil
@@ -236,7 +169,8 @@ proc getClass*(qname: string): MonoClass =
   var exc: MonoObject = nil
   let t = pRuntimeInvoke(mGT, nil, cast[ptr UncheckedArray[pointer]](addr args[0]), addr exc)
   if t == nil or exc != nil: return nil
-  let typePtr = cast[ptr pointer](cast[uint64](t) + 16)[]
+  # MonoReflectionType keeps its MonoType* in the first field after the object header.
+  let typePtr = readPtrAt(t, objectHeaderSize)
   if typePtr == nil: return nil
   pTypeGetClass(typePtr)
 
@@ -248,8 +182,7 @@ proc methodAddr*(c: MonoClass, name: string, np: int): pointer =
   pCompileMethod(m)
 
 proc methodAddrInherited*(c: MonoClass, name: string, np: int, depth = 6): pointer =
-  ## Like methodAddr, but walks base classes: mono_class_get_method_from_name does not, and an
-  ## inherited member can sit several levels above the class a hook was resolved from.
+  ## Like methodAddr, but walks base classes - the name lookup itself does not.
   var cur = c
   for _ in 0 ..< depth:
     if cur == nil: break
@@ -290,8 +223,6 @@ proc moved*(h: MonoGCHandle): MonoObject =
 proc unpin*(h: MonoGCHandle) =
   if h != 0'u32 and pGchandleFree != nil: pGchandleFree(h)
 
-const FIELD_STATIC* = 0x0010'u32
-
 proc nameOf*(p: pointer, get: GetNameFn): string =
   if p == nil or get == nil: return "?"
   let c = get(p)
@@ -324,8 +255,7 @@ proc methodNames*(c: MonoClass, cap = 256): seq[string] =
     if m == nil: break
     result.add nameOf(m, pMethodGetName)
 
-## A non-reference field read through fieldGetPtr would hand back a float or a bool
-## reinterpreted as an address, so every instance walk has to filter on this first.
+## Filter an instance walk on this: fieldGetPtr on a value field reads the value as an address.
 proc fieldIsInstanceRef*(f: MonoField): bool =
   if f == nil or pFieldGetType == nil or pTypeIsReference == nil: return false
   if pFieldGetFlags != nil and (pFieldGetFlags(f) and FIELD_STATIC) != 0'u32: return false
@@ -339,28 +269,11 @@ proc fieldDeclaredClass*(f: MonoField): MonoClass =
   if t == nil: default(MonoClass) else: pTypeGetClass(t)
 
 proc fieldOffset*(c: MonoClass, name: string): int =
-  ## Byte offset of an instance field, or -1. Resolved by name so a layout change in the target
-  ## is a missing field rather than a wrong read.
+  ## Byte offset of an instance field, or -1. By name, so a moved layout reads as absent.
   if c == nil or pClassGetField == nil or pFieldGetOffset == nil: return -1
   var n = name
   let f = pClassGetField(c, n.toCString)
   if f == nil: -1 else: int(pFieldGetOffset(f))
-
-proc readPtrAt*(o: pointer, off: int): pointer =
-  if o == nil or off < 0: default(pointer)
-  else: cast[ptr pointer](cast[uint64](o) + uint64(off))[]
-
-proc readF32At*(o: pointer, off: int): float32 =
-  if o == nil or off < 0: 0.0'f32
-  else: cast[ptr float32](cast[uint64](o) + uint64(off))[]
-
-proc writePtrAt*(o: pointer, off: int, v: pointer) =
-  if o == nil or off < 0: return
-  cast[ptr pointer](cast[uint64](o) + uint64(off))[] = v
-
-proc writeBoolAt*(o: pointer, off: int, v: bool) =
-  if o == nil or off < 0: return
-  cast[ptr uint8](cast[uint64](o) + uint64(off))[] = (if v: 1'u8 else: 0'u8)
 
 proc staticObject*(c: MonoClass, name: string): MonoObject =
   ## Reads a reference-typed static field, initialising the class so the slot is populated.
@@ -397,8 +310,7 @@ proc newInstance*(c: MonoClass): MonoObject =
   o
 
 proc invoke*(m: MonoMethod, obj: pointer, args: ptr UncheckedArray[pointer]): MonoObject =
-  ## Calls a managed method, answering nil when it throws rather than letting the exception
-  ## reach a hook callback the runtime is already unwinding through.
+  ## Answers nil when the method throws; a managed exception must not reach a hook body.
   if m == nil or pRuntimeInvoke == nil: return nil
   var exc: MonoObject = nil
   let r = pRuntimeInvoke(m, obj, args, addr exc)
@@ -411,8 +323,145 @@ proc unboxInt32*(o: MonoObject): int =
   if p == nil: -1 else: int(p[])
 
 proc unboxBool*(o: MonoObject): int =
-  ## 1, 0, or -1 when the value cannot be read: a tri-state, so a caller can tell "false" apart
-  ## from "could not ask".
+  ## Tri-state: 1, 0, or -1 when the value cannot be read.
   if o == nil or pObjUnbox == nil: return -1
   let p = cast[ptr uint8](pObjUnbox(o))
   if p == nil: -1 elif p[] != 0: 1 else: 0
+
+# What `runtime` needs to find this runtime, attach to it, and resolve hooks.
+
+const monoSoname* = "libmonosgen-2.0.so"
+  ## `monoBackend` takes an override for a target that embeds Mono under another name.
+
+type GetPtrFn = proc (): pointer {.cdecl, gcsafe.}
+
+var gImage: ElfSyms
+
+proc monoSym*(name: cstring): pointer {.cdecl.} =
+  ## A `SymResolver` over the attached image.
+  if not gImage.ok: default(pointer) else: gImage.sym(name)
+
+proc monoSyms*(): ElfSyms = gImage
+
+proc install*(h: Hook, cls: MonoClass): bool {.discardable.} =
+  ## For a feature hooking several methods of one class: `getClass` is a managed call each time.
+  h.installAt(methodAddr(cls, h.sym, h.argc))
+
+proc findInherited*(c: MonoClass, name: string, depth = 4): pointer =
+  ## The address of a parameterless method, walking up from `c`.
+  methodAddrInherited(c, name, 0, depth)
+
+proc monoResolve(owner, sym: string, argc: int): pointer =
+  ## `owner` is an assembly-qualified class name, or empty for a Mono entry point.
+  if owner.len == 0:
+    var n = sym
+    return monoSym(n.toCString)
+  let cls = getClass(owner)
+  if cls == nil:
+    logE(shortName(owner) & " class not found")
+    return nil
+  methodAddr(cls, sym, argc)
+
+proc monoReady(): bool =
+  ## corlib only answers once mono_init has built a domain.
+  corlib() != nil
+
+proc callPtrFn(s: ElfSyms, name: cstring): pointer =
+  let fn = asProc[GetPtrFn](s.sym(name))
+  if fn == nil: default(pointer) else: fn()
+
+proc monoIsUp(s: ElfSyms): bool {.gcsafe.} =
+  ## Either accessor answering non-nil means mono_init has run in this image.
+  callPtrFn(s, "mono_get_corlib") != nil or callPtrFn(s, "mono_get_root_domain") != nil
+
+proc monoAttach(s: ElfSyms) =
+  gImage = s
+  resolveMono(monoSym)
+  logI("mono: corlib=" & hex(callPtrFn(s, "mono_get_corlib")) &
+       " root_domain=" & hex(callPtrFn(s, "mono_get_root_domain")))
+
+## The trigger hooks, whose only job is to call `doSetup` from a thread the runtime owns.
+## ldstr and object_new are the hot pair that keeps retrying; the rest cover startup.
+type
+  LdstrFn = proc (a0, a1, a2, a3: pointer): MonoString {.cdecl, gcsafe.}
+  ObjNewFn = proc (d: MonoDomain, k: MonoClass): MonoObject {.cdecl, gcsafe.}
+  JitInitFn = proc (name: cstring): MonoDomain {.cdecl, gcsafe.}
+  JitExecFn = proc (d: MonoDomain, asmv: pointer, argc: cint,
+                    argv: pointer): cint {.cdecl, gcsafe.}
+  RunMainFn = proc (asmv: pointer, argc: cint, argv: pointer): cint {.cdecl, gcsafe.}
+
+var
+  hLdstr = newHook("", "mono_ldstr_checked", 0, nil)
+  hObjNew = newHook("", "mono_object_new", 0, nil)
+  hJitInit = newHook("", "mono_jit_init", 0, nil)
+  hJitExec = newHook("", "mono_jit_exec", 0, nil)
+  hRunMain = newHook("", "mono_runtime_run_main", 0, nil)
+
+var
+  ldstrCalls = 0
+  objNewCalls = 0
+
+proc hookLdstr(a0, a1, a2, a3: pointer): MonoString {.cdecl.} =
+  guard "ldstr":
+    if a0 != nil: setDomain(a0)
+    inc ldstrCalls
+    if ldstrCalls <= 5 or ldstrCalls mod 500 == 0: logI("ldstr call #" & $ldstrCalls)
+    if not gSetup.load() and ldstrCalls mod 20 == 2: doSetup()
+  let orig = origAs[LdstrFn](hLdstr)
+  if orig != nil: orig(a0, a1, a2, a3) else: nil
+
+proc hookObjNew(d: MonoDomain, k: MonoClass): MonoObject {.cdecl.} =
+  guard "object_new":
+    if d != nil: setDomain(d)
+    inc objNewCalls
+    if objNewCalls <= 5 or objNewCalls mod 2000 == 0:
+      logI("object_new call #" & $objNewCalls)
+    if not gSetup.load() and objNewCalls mod 50 == 7: doSetup()
+  let orig = origAs[ObjNewFn](hObjNew)
+  if orig != nil: orig(d, k) else: nil
+
+proc hookJitInit(name: cstring): MonoDomain {.cdecl.} =
+  logI("jit_init('" & (if name == nil: "?" else: fromCString(name)) & "') called")
+  let orig = origAs[JitInitFn](hJitInit)
+  result = if orig != nil: orig(name) else: nil
+  if result != nil: setDomain(result)
+  if not gSetup.load(): doSetup()
+
+proc hookJitExec(d: MonoDomain, asmv: pointer, argc: cint, argv: pointer): cint {.cdecl.} =
+  logI("jit_exec called")
+  if d != nil: setDomain(d)
+  if not gSetup.load(): doSetup()
+  let orig = origAs[JitExecFn](hJitExec)
+  if orig != nil: orig(d, asmv, argc, argv) else: -1
+
+proc hookRunMain(asmv: pointer, argc: cint, argv: pointer): cint {.cdecl.} =
+  logI("run_main called")
+  if pGetRootDomain != nil: setDomain(pGetRootDomain())
+  if not gSetup.load(): doSetup()
+  let orig = origAs[RunMainFn](hRunMain)
+  if orig != nil: orig(asmv, argc, argv) else: -1
+
+hLdstr.replacement = asPointer(hookLdstr)
+hObjNew.replacement = asPointer(hookObjNew)
+hJitInit.replacement = asPointer(hookJitInit)
+hJitExec.replacement = asPointer(hookJitExec)
+hRunMain.replacement = asPointer(hookRunMain)
+
+proc installTrigger(h: Hook) =
+  ## Through `monoSym`, so a trigger does not depend on this being the active backend.
+  var n = h.sym
+  if not h.installAt(monoSym(n.toCString)):
+    logE(h.sym & " hook failed")
+
+proc monoTriggers(s: ElfSyms) =
+  installTrigger(hLdstr)
+  installTrigger(hObjNew)
+  installTrigger(hJitInit)
+  installTrigger(hJitExec)
+  installTrigger(hRunMain)
+  logI("mono hooked")
+
+proc monoBackend*(soname = monoSoname): Backend =
+  ## Hand this to `useBackend` to target a Mono runtime.
+  Backend(name: "mono", soname: soname, probe: monoIsUp, attach: monoAttach,
+          triggers: monoTriggers, ready: monoReady, resolve: monoResolve)

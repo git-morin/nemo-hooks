@@ -1,13 +1,10 @@
 ## Symbol lookup against a shared object already mapped into this process, read straight out of
-## its in-memory image. Raw interop; see nemohooks.nim for why these two features are on.
-when defined(nimony):
-  {.feature: "lenientnils".}
-  {.feature: "assumeSync".}
+## its in-memory image.
+include nemohooks/features
 
 import std/strutils
+import compat
 
-## `lines` is auto-imported from system in Nim 2 but lives in syncio under Nimony, which also
-## drops parseHexInt in favour of a parseHex that writes through an out parameter.
 when defined(nimony):
   import std/[syncio, parseutils]
 
@@ -59,6 +56,12 @@ type
   LibInstance* = object
     base*, limit*: uint64
 
+  SymResolver* = proc (name: cstring): pointer {.cdecl, gcsafe.}
+    ## The address of a symbol in a mapped image.
+
+  ReadyProbe* = proc (s: ElfSyms): bool {.nimcall, gcsafe.}
+    ## Asked of a candidate image: is *this* copy the initialised one?
+
 proc ok*(s: ElfSyms): bool = s.strtab != nil and s.symtab != nil and s.count > 0
 
 proc sym*(s: ElfSyms, name: cstring): pointer =
@@ -71,9 +74,7 @@ proc sym*(s: ElfSyms, name: cstring): pointer =
   nil
 
 proc elfSymsAt*(base: uint64): ElfSyms =
-  ## `base` comes from `/proc/self/maps` and may be anything, so every failure answers with a non-ok result rather than raising
-  # Nimony proves `result` is assigned before any path returns; the bare returns below used to
-  # lean on Nim 2 zero-initialising it.
+  ## A non-ok result for anything that is not a readable ELF image. Never raises.
   result = default(ElfSyms)
   let eh = cast[ptr Elf64Ehdr](base)
   if eh.ident[0] != 0x7f or eh.ident[1] != byte('E') or
@@ -89,7 +90,7 @@ proc elfSymsAt*(base: uint64): ElfSyms =
   if dynVa == 0 or minVa == high(uint64): return
 
   let bias = base - minVa
-  # bionic leaves DT_* pointer entries as link-time vaddrs on some paths and pre-relocates them on others. A value already at or above the load bias is clearly the latter.
+  # bionic pre-relocates DT_* pointer entries on some paths and leaves link-time vaddrs on others.
   template fix(v: uint64): uint64 = (if v >= bias: v else: bias + v)
 
   var
@@ -110,9 +111,7 @@ proc elfSymsAt*(base: uint64): ElfSyms =
     else: discard
     d = cast[ptr Elf64Dyn](cast[uint64](d) + uint64(sizeof(Elf64Dyn)))
 
-  # The GNU table stores no symbol count, so derive it from the highest bucket's chain
-  # terminator. Only reachable for an image linked --hash-style=gnu alone; a lib carrying both
-  # tables answers from DT_HASH above.
+  # The GNU table stores no symbol count, so derive it from the highest bucket's chain end.
   if count == 0 and gnu != nil:
     let
       nbucket = gnu[0]
@@ -135,10 +134,8 @@ proc elfSymsAt*(base: uint64): ElfSyms =
   result = ElfSyms(bias: bias, strtab: strtab, symtab: symtab, count: count, syment: syment)
 
 proc residentInstances*(soname: string): seq[LibInstance] =
-  ## Every mapped load of `soname`, as its own tight range. A process can have several copies
-  ## of one soname mapped at once (a customised zygote preloading a lib the app also ships
-  ## privately), so one span over all matching lines would treat the gap between two unrelated
-  ## images as valid. File offset 0 starts a fresh load; later segments extend it.
+  ## Every mapped load of `soname`, as its own range - a process can have several of one
+  ## soname. File offset 0 starts a load; later segments extend it.
   result = @[]
   try:
     for line in lines("/proc/self/maps"):
@@ -159,26 +156,44 @@ proc residentInstances*(soname: string): seq[LibInstance] =
   except:
     discard
 
-proc findLiveImage*(soname: string, readyProbe: proc(s: ElfSyms): bool {.nimcall,
-    gcsafe.}): ElfSyms =
+proc findLiveImage*(soname: string, readyProbe: ReadyProbe): ElfSyms =
   ## The initialised instance of `soname`, or a non-ok result while none is up yet.
   ##
-  ## dlopen cannot reach a library in another linker namespace. bionic's already-loaded check
-  ## (find_loaded_library_by_realpath) is scoped to the *calling* namespace, and an injected
-  ## module runs outside the target's per-APK ClassLoader namespace while the runtime is one of
-  ## the target's private libs inside it - so dlopen of its path never finds the running
-  ## instance to reuse, and instead maps a second copy whose mono_init() has never run. Every
-  ## accessor in that copy then reads zeroed globals, and the dlopen also runs the copy's
-  ## DT_INIT_ARRAY constructors.
-  ##
-  ## RTLD_NOLOAD and dl_iterate_phdr are namespace-scoped too, so /proc/self/maps is the only
-  ## view left. Walking the mapped image needs no file access because .dynsym, .dynstr and
-  ## .hash all sit inside the first PT_LOAD.
-  ##
-  ## Asking the image itself whether it is ready is both the "is the runtime up?" test and what
-  ## separates the live runtime from a never-initialised copy, so there is no timing to guess.
+  ## dlopen, RTLD_NOLOAD and dl_iterate_phdr are all scoped to the calling linker namespace,
+  ## which an injected module is outside of, so `/proc/self/maps` is the only view of the
+  ## target's own libraries. `readyProbe` tells the live runtime from a never-initialised copy.
   result = default(ElfSyms)
   for inst in residentInstances(soname):
     let s = elfSymsAt(inst.base)
     if not s.ok: continue
     if readyProbe(s): return s
+
+proc liveImage*(soname: string): ElfSyms =
+  ## The first mapped load of `soname` whose symbol tables can be read. A managed runtime wants
+  ## `findLiveImage` instead, which asks whether the copy is the initialised one.
+  result = default(ElfSyms)
+  for inst in residentInstances(soname):
+    let s = elfSymsAt(inst.base)
+    if s.ok: return s
+
+proc symbolIn*(soname, name: string): pointer =
+  ## The address of an exported symbol in a library already mapped into this process.
+  let s = liveImage(soname)
+  if not s.ok: return nil
+  var n = name
+  s.sym(n.toCString)
+
+proc offsetIn*(soname: string, offset: int): pointer =
+  ## An address inside a mapped library, as the file offset a disassembler shows.
+  let s = liveImage(soname)
+  if not s.ok: return nil
+  cast[pointer](s.bias + uint64(offset))
+
+proc parseHexAddr*(s: string): int =
+  ## Hex with an optional `0x`, or -1 when `s` is not a number - offset zero is a valid answer.
+  var t = s
+  if t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X'): t = t[2 .. ^1]
+  if t.len == 0: return -1
+  for i in 0 ..< t.len:
+    if t[i] notin {'0' .. '9', 'a' .. 'f', 'A' .. 'F'}: return -1
+  parseHexInt(t)
