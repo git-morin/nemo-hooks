@@ -1,0 +1,213 @@
+name: Check & Release
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+  workflow_dispatch:
+
+# Read by default so the jobs running third-party actions cannot touch the repository; only the
+# release job, which runs first-party actions only, is granted write.
+permissions:
+  contents: read
+
+# Serialised per branch: the release job reads the tags its predecessor published and pushes a
+# version bump of its own, so overlapping runs would compute the same version twice.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NIM_VERSION: '2.2.12'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@189b145833368cc92f1e7b3e166a25a3e057a693 # v2
+        with:
+          nim-version: ${{ env.NIM_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # nim.cfg names the android/arm64 target, which is the only one this library is built
+      # for, so the check runs against it here too. Nimony is the other half of the gate but
+      # ships as a nightly zip a workflow cannot pin, so `make nimony-check` stays local.
+      - name: Type-check Nim
+        run: make check
+
+      - name: Check Nim formatting
+        run: |
+          fail=0
+          tmp=$(mktemp -d)
+          for f in src/*.nim src/nemohooks/*.nim; do
+            cp "$f" "$tmp/$(basename "$f")"
+            nimpretty --maxLineLen:100 --out:"$tmp/$(basename "$f")" "$f"
+            if ! diff -u "$f" "$tmp/$(basename "$f")"; then
+              echo "::error file=$f::not formatted (run 'make fmt')"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      # The package has to stay installable, which is a separate failure mode from compiling:
+      # a bad srcDir or a main module that does not match the package name only shows up here.
+      - name: Check the package installs
+        run: nimble install -y
+
+  version:
+    needs: lint
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.v.outputs.name }}
+      tag: ${{ steps.v.outputs.tag }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute version
+        id: v
+        run: |
+          set -euo pipefail
+
+          # Tags are plain `vX.Y.Z`, which is what nimble and pnak resolve a `requires` range
+          # against. VDExtra's VersionCode-VersionName tags exist for the LSPosed module repo;
+          # a library has no versionCode, so that half of the scheme is dropped here.
+          stable_tag=$(git tag -l 'v[0-9]*' | sort -V | tail -1 || true)
+          declared=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' nemohooks.nimble)
+
+          if [ -z "$stable_tag" ]; then
+            # First release: publish the version already declared in the .nimble rather than
+            # bumping up from 0.0.0, which would land below what VDExtra already requires.
+            next="$declared"
+            range=""
+            bump="none (first release, taken from nemohooks.nimble)"
+          else
+            base=$(echo "${stable_tag#v}" | awk -F. '{printf "%d.%d.%d", $1, $2, ($3=="" ? 0 : $3)}')
+            major=$(echo "$base" | cut -d. -f1)
+            minor=$(echo "$base" | cut -d. -f2)
+            patch=$(echo "$base" | cut -d. -f3)
+            range="$stable_tag..HEAD"
+
+            # Gitmoji drives the bump, since the subjects carry no conventional-commit type.
+            # Anchored at the start of the subject so a commit *describing* a marker cannot
+            # trip it. Shortcodes only, matching the convention the history uses.
+            subjects=$(git log --pretty=%s "$range")
+            if echo "$subjects" | grep -q '^:boom:'; then
+              major=$((major + 1)); minor=0; patch=0; bump=major
+            elif echo "$subjects" | grep -qE '^(:sparkles:|:globe_with_meridians:)'; then
+              minor=$((minor + 1)); patch=0; bump=minor
+            else
+              patch=$((patch + 1)); bump=patch
+            fi
+            next="$major.$minor.$patch"
+          fi
+
+          # Only the paths a consumer actually compiles count as a change worth a tag, so a
+          # README or workflow push does not burn a version. VDExtra releases every push to
+          # main because a stable APK is a deliberate act; here main is the only release
+          # branch, so the gate that protects the dev channel there applies to main instead.
+          #
+          # The previous tag points at the bump commit itself, so the .nimble edit this job
+          # makes is never what the diff sees.
+          publish=true
+          if [ -n "$stable_tag" ] && git diff --quiet "$stable_tag" HEAD -- src nemohooks.nimble nim.cfg; then
+            publish=false
+            echo "no library source change since $stable_tag, skipping the release"
+          fi
+
+          {
+            echo "name=$next"
+            echo "tag=v$next"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### $next"
+            echo
+            # The bump commits this job writes are mechanical, so they stay out of the notes.
+            git log --pretty='- %s' ${range:+$range} | grep -v '^- :bookmark:' || true
+          } > changelog.md
+          cat changelog.md
+          echo "bump: $bump, from ${stable_tag:-no previous tag}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: changelog
+          path: changelog.md
+
+  release:
+    needs: version
+    # Only a real push to main publishes. A manual dispatch just runs the gate, and the owner
+    # check keeps a fork, or anyone who reaches a branch here, from publishing under this
+    # repo's name and pushing to its main.
+    if: >-
+      github.event_name == 'push'
+      && needs.version.outputs.publish == 'true'
+      && github.repository == 'git-morin/nemo-hooks'
+      && github.actor == 'git-morin'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: changelog
+
+      # nimble and pnak read the version out of the .nimble at the tagged commit, not out of
+      # the tag name, so the two have to agree or a consumer's `requires` range resolves to the
+      # wrong release. That is why this is the one version in the tree rather than derived from
+      # tags the way VDExtra's is - and why the bump is committed before the tag is cut.
+      - name: Bump the declared version and tag it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          NAME: ${{ needs.version.outputs.name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already published, nothing to do"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          sed -i "s/^version .*/version       = \"$NAME\"/" nemohooks.nimble
+          grep -q "\"$NAME\"" nemohooks.nimble
+
+          # [skip ci] is load-bearing: this push lands on main and would otherwise retrigger
+          # the workflow, which would then compute the next patch version off its own commit.
+          if ! git diff --quiet -- nemohooks.nimble; then
+            git commit -q -m ":bookmark: $NAME [skip ci]" -- nemohooks.nimble
+            git push origin HEAD:main
+          fi
+
+          echo "RELEASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          NAME: ${{ needs.version.outputs.name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already published, nothing to do"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --title "$NAME" \
+            --notes-file changelog.md \
+            --target "${RELEASE_SHA:-$GITHUB_SHA}"

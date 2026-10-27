@@ -1,0 +1,7 @@
+nimcache/
+nimble.paths
+nimble.develop
+nimony.paths
+deps/
+*.nif
+.tools/
