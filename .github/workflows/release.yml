@@ -11,8 +11,8 @@ on:
 permissions:
   contents: read
 
-# Serialised per branch: the release job reads the tags its predecessor published and pushes a
-# version bump of its own, so overlapping runs would compute the same version twice.
+# Serialised per branch: the release job reads the tags its predecessor published and the dev
+# prune deletes every prerelease but its own, so overlapping runs would drop or delete a release.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -57,11 +57,13 @@ jobs:
 
   version:
     needs: lint
-    if: github.ref_name == 'main'
+    if: github.ref_name == 'main' || github.ref_name == 'dev'
     runs-on: ubuntu-latest
     outputs:
       name: ${{ steps.v.outputs.name }}
       tag: ${{ steps.v.outputs.tag }}
+      channel: ${{ steps.v.outputs.channel }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
       publish: ${{ steps.v.outputs.publish }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -75,7 +77,9 @@ jobs:
           set -euo pipefail
 
           # Plain `vX.Y.Z`, which is what nimble and pnak resolve a `requires` range against.
-          stable_tag=$(git tag -l 'v[0-9]*' | sort -V | tail -1 || true)
+          # Prereleases carry a -dev.N suffix and are excluded: the bump is always measured
+          # from the last stable release.
+          stable_tag=$(git tag -l 'v[0-9]*' | grep -v -- '-dev\.' | sort -V | tail -1 || true)
           declared=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' nemohooks.nimble)
 
           if [ -z "$stable_tag" ]; then
@@ -102,22 +106,42 @@ jobs:
             next="$major.$minor.$patch"
           fi
 
-          # Only the paths a consumer compiles count as a change worth a tag. The previous tag
-          # points at the bump commit, so this job's own .nimble edit is never what the diff sees.
+          # main is the stable channel, dev the prerelease one. Both cut the same version; only
+          # dev qualifies it with how many commits have landed since the last stable release.
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            channel=stable
+            name="$next"
+            prerelease=false
+          else
+            channel=dev
+            n=$(git log --pretty=%s ${range:+$range} | grep -vc '^:bookmark:' || true)
+            [ "$n" -lt 1 ] && n=1
+            name="$next-dev.$n"
+            prerelease=true
+          fi
+
+          # Only the paths a consumer compiles count as a change worth a dev tag, so a docs or
+          # workflow push does not burn one. main always publishes: a stable release is a
+          # deliberate act, not a consequence of what happened to change.
           publish=true
-          if [ -n "$stable_tag" ] && git diff --quiet "$stable_tag" HEAD -- src nemohooks.nimble nim.cfg; then
-            publish=false
-            echo "no library source change since $stable_tag, skipping the release"
+          if [ "$channel" = dev ]; then
+            prev=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)
+            if [ -n "$prev" ] && git diff --quiet "$prev" HEAD -- src nemohooks.nimble nim.cfg; then
+              publish=false
+              echo "no library source change since $prev, skipping the release"
+            fi
           fi
 
           {
-            echo "name=$next"
-            echo "tag=v$next"
+            echo "name=$name"
+            echo "tag=v$name"
+            echo "channel=$channel"
+            echo "prerelease=$prerelease"
             echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
 
           {
-            echo "### $next"
+            echo "### $name ($channel)"
             echo
             # The bump commits this job writes stay out of the notes.
             git log --pretty='- %s' ${range:+$range} | grep -v '^- :bookmark:' || true
@@ -132,7 +156,7 @@ jobs:
 
   release:
     needs: version
-    # Only a real push to main publishes; the owner check keeps a fork from publishing here.
+    # Only a real push publishes; the owner check keeps a fork from publishing here.
     if: >-
       github.event_name == 'push'
       && needs.version.outputs.publish == 'true'
@@ -152,8 +176,11 @@ jobs:
           name: changelog
 
       # nimble reads the version from the .nimble at the tagged commit, not from the tag name,
-      # so the bump is committed before the tag is cut.
+      # so the bump is committed before the tag is cut. Only the stable channel does this: a
+      # prerelease is pinned by tag or commit, never resolved from a `requires` range, and a
+      # bookmark commit per push to dev would be noise in the history.
       - name: Bump the declared version and tag it
+        if: needs.version.outputs.channel == 'stable'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.version.outputs.tag }}
@@ -184,13 +211,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.version.outputs.tag }}
           NAME: ${{ needs.version.outputs.name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "$TAG already published, nothing to do"
             exit 0
           fi
-          gh release create "$TAG" \
-            --title "$NAME" \
-            --notes-file changelog.md \
-            --target "${RELEASE_SHA:-$GITHUB_SHA}"
+          flags=(--title "$NAME" --notes-file changelog.md --target "${RELEASE_SHA:-$GITHUB_SHA}")
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "$TAG" "${flags[@]}"
+
+      # dev is a moving target, so keep only the newest prerelease and let its tag go with it.
+      - name: Prune superseded dev prereleases
+        if: needs.version.outputs.channel == 'dev'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh release list --limit 100 --json tagName,isPrerelease \
+            -q '.[] | select(.isPrerelease) | .tagName' \
+          | grep -- '-dev\.' | grep -vx "$TAG" \
+          | while read -r old; do
+              echo "deleting superseded $old"
+              gh release delete "$old" --yes --cleanup-tag
+            done

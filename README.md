@@ -18,13 +18,15 @@ A **backend** is the one runtime-specific part of a module. Three ship with the 
 
 ## Releases
 
-Tags are plain `vX.Y.Z` on `main`, which is what a nimble or pnak `requires` range resolves
-against, and the tagged commit's `.nimble` always declares the same version. The bump is
-derived from the gitmoji on the commits since the last tag: `:boom:` major,
-`:sparkles:`/`:globe_with_meridians:` minor, anything else patch. A push that touches only docs
-or CI does not cut a release.
+`dev` and `main` are the only branches. Every push to `dev` publishes a `vX.Y.Z-dev.N`
+prerelease and prunes the one before it; merging to `main` cuts the stable `vX.Y.Z`.
 
-To pin unreleased work, point at a commit instead:
+The bump comes from the gitmoji on the commits since the last stable tag: `:boom:` major,
+`:sparkles:`/`:globe_with_meridians:` minor, anything else patch. A push touching only docs or
+CI does not burn a dev version, and `main` always publishes.
+
+A stable tag's `.nimble` declares the same version, which is what a nimble or pnak `requires`
+range resolves against. Prereleases are not range material - pin one by tag, or a commit:
 
 ```nim
 requires "https://github.com/git-morin/nemo-hooks#<sha>"
