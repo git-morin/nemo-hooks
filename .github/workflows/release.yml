@@ -94,11 +94,15 @@ jobs:
             patch=$(echo "$base" | cut -d. -f3)
             range="$stable_tag..HEAD"
 
-            # Gitmoji drives the bump. Anchored at the start of the subject, shortcodes only.
+            # Conventional Commits drive the bump. A `!` before the colon marks a breaking change,
+            # as does a BREAKING CHANGE footer in the body; `feat` is a minor, anything else a patch.
+            # Anchored at the start of the subject so a commit *describing* a type cannot trip it.
             subjects=$(git log --pretty=%s "$range")
-            if echo "$subjects" | grep -q '^:boom:'; then
+            bodies=$(git log --pretty=%B "$range")
+            if echo "$subjects" | grep -qE '^[a-z]+(\([^)]*\))?!:' \
+               || echo "$bodies" | grep -qE '^BREAKING[ -]CHANGE:'; then
               major=$((major + 1)); minor=0; patch=0; bump=major
-            elif echo "$subjects" | grep -qE '^(:sparkles:|:globe_with_meridians:)'; then
+            elif echo "$subjects" | grep -qE '^feat(\([^)]*\))?:'; then
               minor=$((minor + 1)); patch=0; bump=minor
             else
               patch=$((patch + 1)); bump=patch
@@ -114,7 +118,7 @@ jobs:
             prerelease=false
           else
             channel=dev
-            n=$(git log --pretty=%s ${range:+$range} | grep -vc '^:bookmark:' || true)
+            n=$(git log --pretty=%s ${range:+$range} | grep -vc '^chore(release):' || true)
             [ "$n" -lt 1 ] && n=1
             name="$next-dev.$n"
             prerelease=true
@@ -144,7 +148,7 @@ jobs:
             echo "### $name ($channel)"
             echo
             # The bump commits this job writes stay out of the notes.
-            git log --pretty='- %s' ${range:+$range} | grep -v '^- :bookmark:' || true
+            git log --pretty='- %s' ${range:+$range} | grep -v '^- chore(release):' || true
           } > changelog.md
           cat changelog.md
           echo "bump: $bump, from ${stable_tag:-no previous tag}"
@@ -178,7 +182,7 @@ jobs:
       # nimble reads the version from the .nimble at the tagged commit, not from the tag name,
       # so the bump is committed before the tag is cut. Only the stable channel does this: a
       # prerelease is pinned by tag or commit, never resolved from a `requires` range, and a
-      # bookmark commit per push to dev would be noise in the history.
+      # release commit per push to dev would be noise in the history.
       - name: Bump the declared version and tag it
         if: needs.version.outputs.channel == 'stable'
         env:
@@ -200,7 +204,7 @@ jobs:
 
           # [skip ci] is load-bearing: this push lands on main and would retrigger the workflow.
           if ! git diff --quiet -- nemohooks.nimble; then
-            git commit -q -m ":bookmark: $NAME [skip ci]" -- nemohooks.nimble
+            git commit -q -m "chore(release): $NAME [skip ci]" -- nemohooks.nimble
             git push origin HEAD:main
           fi
 
