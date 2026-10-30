@@ -1,4 +1,4 @@
-version       = "1.0.1"
+version       = "1.0.2"
 author        = "git-morin"
 description   = "Write Xposed-style hooks in Nim: Mono, IL2CPP and native targets"
 license       = "MIT"
