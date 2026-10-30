@@ -7,9 +7,30 @@ NIM_SRC := $(wildcard src/*.nim src/nemohooks/*.nim src/nemohooks/backends/*.nim
 NIM_CHECK := $(NIM_MAIN) $(wildcard src/nemohooks/backends/*.nim examples/*.nim)
 TOOLS_DIR := .tools
 NIMONY_VERSION := 0.6.3
+NIMONY_HOME := $(TOOLS_DIR)/nimony-$(NIMONY_VERSION)
 # Overridable so one unpacked toolchain can serve several checkouts.
-NIMONY_DIR ?= $(TOOLS_DIR)/nimony-$(NIMONY_VERSION)/nimony
-NIMONY := $(NIMONY_DIR)/bin/nimony.exe
+NIMONY_DIR ?= $(NIMONY_HOME)/nimony
+# Host detection. Only two things here are platform-specific: executables carry a .exe suffix on
+# Windows, and the Nimony toolchain ships one archive per platform (.tar.xz for Linux and macOS,
+# .zip for Windows). Everything else is the same shell on all three.
+HOST_OS := $(shell uname -s)
+HOST_ARCH := $(shell uname -m)
+NIMONY_ARCH := $(if $(filter arm64 aarch64,$(HOST_ARCH)),arm64,amd64)
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(HOST_OS)))
+  EXE := .exe
+  NIMONY_ASSET := *windows_amd64.zip
+  NIMONY_EXTRACT = unzip -o $(TOOLS_DIR)/nimony-*.zip -d $(NIMONY_HOME)
+else ifeq ($(HOST_OS),Darwin)
+  EXE :=
+  # Upstream publishes an arm64 build only; an Intel Mac runs it under Rosetta.
+  NIMONY_ASSET := *macos_arm64.tar.xz
+  NIMONY_EXTRACT = mkdir -p $(NIMONY_HOME) && tar -xf $(TOOLS_DIR)/nimony-*.tar.xz -C $(NIMONY_HOME)
+else
+  EXE :=
+  NIMONY_ASSET := *linux_$(NIMONY_ARCH).tar.xz
+  NIMONY_EXTRACT = mkdir -p $(NIMONY_HOME) && tar -xf $(TOOLS_DIR)/nimony-*.tar.xz -C $(NIMONY_HOME)
+endif
+NIMONY := $(NIMONY_DIR)/bin/nimony$(EXE)
 # --compat makes Nimony read the same nim.cfg Nim 2 uses.
 NIMONY_FLAGS := --compat --os:android --cpu:arm64
 
@@ -28,8 +49,8 @@ require-nimony:
 	@test -x "$(NIMONY)" || { \
 	  echo "Nimony $(NIMONY_VERSION) not found in $(NIMONY_DIR)."; \
 	  echo "Fetch it with:"; \
-	  echo "  gh release download --repo nim-lang/nimony-website --pattern '*windows_amd64.zip' --dir $(TOOLS_DIR)"; \
-	  echo "  unzip -o $(TOOLS_DIR)/nimony-*.zip -d $(TOOLS_DIR)/nimony-$(NIMONY_VERSION)"; \
+	  echo "  gh release download --repo nim-lang/nimony-website --pattern '$(NIMONY_ASSET)' --dir $(TOOLS_DIR)"; \
+	  echo "  $(NIMONY_EXTRACT)"; \
 	  exit 1; }
 
 fmt-check: # Check formatting without rewriting anything
